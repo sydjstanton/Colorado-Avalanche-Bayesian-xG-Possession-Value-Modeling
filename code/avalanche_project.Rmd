@@ -1,0 +1,1337 @@
+---
+title: "Avalanche Project"
+output: word_document
+date: "2026-02-04"
+editor_options: 
+  chunk_output_type: inline
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+Goal: Data analysis project using Bayesian statistics on Colorado Avalanche data.
+
+# Background 
+```{r}
+#load libraries 
+library(tidyverse)
+library(ggplot2)
+library(arrow) # to read in data 
+library(dplyr)
+library(brms) #bayesian regression
+library(tidybayes) #posterior
+library(loo) #model comparison 
+library(patchwork) #combing plots 
+library(ggrepel) #non-overlapping labels on quadrant plots
+library(knitr) # for nice table 
+```
+
+```{r}
+#load data
+players <- read_parquet("~/personal/NHL/players.parquet") #one record per game with team and outcome information
+games <-  read_parquet("~/personal/NHL/games.parquet") #one record per game with team and outcome information
+stints <-  read_parquet("~/personal/NHL/stints.parquet") #one record per player per stint (a stretch of play during which a set of distinct players is on the ice)
+events <-  read_parquet("~/personal/NHL/events.parquet") #one record per event
+tracking <-  read_parquet("~/personal/NHL/tracking.parquet") #one record per player per event
+```
+
+*Datasets Info.*
+Players: 1172 obs. of 8 variables 
+player_id, player_name, last_name, first_name, handed, birth_date, position_group, primary_position 
+
+Games: 480 obs. of 12 variables 
+game_id, game_date, league, season, home_team, away_team, home_team_id, away_team_id, home_score, away_score, game_outcome, home_start_net 
+
+Stints: 480 obs. of 12 variables
+game_id, game_date, league, season, home_team, away_team, home_team_id, away_team_id, home_score, away_score, game_outcome, home_start_net 
+
+Events: 1800464 obs. of 24 variables 
+game_id, period, period_time, game_stint, sl_event_id, sequence_id, player_id, player_name, team, team_id, opp_team, opp_team_id, event_type, outcome, flags, description, detail, sl_xg_all_shots, x, y, x_adj, y_adj, has_tracking_data, event_player_tracked   
+
+Tracking: 13529224 obs. of 10 variables
+game_id, sl_event_id, team_id, team_name, player_id, player_name, tracking_x, tracking_y, tracking_vel_x, tracking_vel_y 
+
+
+##1st  How do expected goals (xG) very by location and player?
+
+# Part 1 estimated a static xG surface: how shot location drives goal probability,
+# with player-level random intercepts capturing individual deviations from that surface.
+Model: Bayesian hierarchical logistic regression 
+-modeling shot success probability as a function of spatial stats w/ partial pooling by player
+
+# Preprocessing Data 
+```{r}
+#filter + prepare shot data 
+shots <- events %>%
+  filter(
+    event_type %in% c("shot", "goal"),
+    !is.na(x_adj),
+    !is.na(y_adj),
+    !is.na(outcome),
+    !is.na(player_id)
+  ) %>%
+  mutate(
+    goal = as.integer(event_type == "goal"),  #target: goal scored or not
+    x_scaled = scale(x_adj)[,1],
+    y_scaled = scale(y_adj)[,1]
+  )
+##RERUN FOR THIS 
+shots <- shots %>%
+  mutate(
+    # Flip coordinates so all shots attack in the same direction
+    x_offense = abs(x_adj),        # distance from own goal always positive
+    y_offense = ifelse(x_adj > 0, -y_adj, y_adj),  # mirror y accordingly
+    
+    #rescale 
+    x_scaled = scale(x_offense)[,1],
+    y_scaled = scale(y_offense)[,1]
+  )
+```
+
+```{r}
+count(shots, event_type, goal)
+shots %>% count(goal) %>% mutate(pct = n / sum(n)) # making sure distribution is correct % of goals scored to not 
+```
+
+
+```{r}
+#model formula
+shot_formula <- bf(
+  goal ~ x_scaled + y_scaled + I(x_scaled^2) + I(y_scaled^2) + (1| player_id) #random intercept
+)
+```
+
+Fixed effects capture the population-level shooting probability as a function of location. 
+The quadratic terms let the xG surface curve.
+
+(1 | player_id) is the partial pooling term
+-each player gets their own intercept offset
+
+```{r eval = FALSE}
+#set priors 
+priors <- c(
+  prior(normal(0, 1.5), class = b),           # fixed effect coeff.
+  prior(normal(-2, 1),  class = Intercept),   # baseline log-odds; ~12% base rate
+  prior(exponential(1), class = sd)           # SD player random effects
+)
+```
+
+For prior, league-wide shooting % is roughly 10–12%, which on the log-odds scale is about log(0.11 / 0.89) ≈ -2.1. 
+-rules out crazy values
+
+https://cran.r-project.org/bin/windows/Rtools/
+
+```{r eval = FALSE}
+#Save and reload the compiled fit object
+if (!file.exists("fit.rds")) {
+  fit <- brm(
+  formula  = shot_formula,
+  data     = shots,
+  family   = bernoulli(link = "logit"),
+  prior    = priors,
+  chains   = 2,
+  iter     = 1000,          # 500 warmup + 500 sampling per chain
+  cores    = 4,   # for speed 
+  seed     = 42,
+  control  = list(adapt_delta = 0.95)   # reduce divergences on hierarchical models
+)
+  saveRDS(fit, "fit.rds")
+} else {
+  fit <- readRDS("fit.rds")
+}
+```
+
+```{r eval = FALSE}
+#check the model
+summary(fit)  #look at Rhat 
+
+#Posterior predictive check
+pp_check(fit, ndraws = 20)
+```
+
+```{r eval = FALSE}
+# compare to recorded xG
+# Check the variable exists and its range
+shots %>%
+  filter(!is.na(sl_xg_all_shots)) %>%
+  summarise(
+    n        = n(),
+    mean_xg  = mean(sl_xg_all_shots),
+    min_xg   = min(sl_xg_all_shots),
+    max_xg   = max(sl_xg_all_shots)
+  )
+
+#extract models predictions + join them
+#posterior mean xG for every shot
+shots$xg_model <- posterior_epred(
+  fit,
+  newdata        = shots,
+  re_formula     = NA,          # population-level only
+  allow_new_levels = TRUE
+) %>% colMeans()
+
+# Join + compare
+comparison <- shots %>%
+  filter(!is.na(sl_xg_all_shots)) %>%
+  select(player_id, player_name, goal, xg_model, sl_xg_all_shots)
+```
+
+```{r eval = FALSE}
+#run comparisons 
+#Correlation
+cor(comparison$xg_model, comparison$sl_xg_all_shots, use = "complete.obs")
+
+#plot
+ggplot(comparison, aes(x = sl_xg_all_shots, y = xg_model)) +
+  geom_point(alpha = 0.1) +
+  geom_abline(slope = 1, intercept = 0, color = "red", linetype = "dashed") +
+  geom_smooth(method = "lm", color = "blue") +
+  labs(
+    title = "Model xG vs Avs xG",
+    x     = "Avs xG ",
+    y     = "Bayesian xG"
+  )
+
+#calibration
+comparison %>%
+  summarise(
+    your_xg_mean      = mean(xg_model),
+    avs_xg_mean       = mean(sl_xg_all_shots)
+  )
+```
+
+```{r eval = FALSE}
+# visual of xG surface 
+#grid over the rink
+grid <- expand_grid(
+  x_offense = seq(min(shots$x_offense), max(shots$x_offense), length.out = 80),
+  y_offense = seq(min(shots$y_offense), max(shots$y_offense), length.out = 80)
+) %>%
+  mutate(
+    x_scaled = (x_offense - mean(shots$x_offense)) / sd(shots$x_offense),
+    y_scaled = (y_offense - mean(shots$y_offense)) / sd(shots$y_offense),
+    player_id = NA
+  )
+
+grid$xg <- posterior_epred(fit, newdata = grid, re_formula = NA, allow_new_levels = TRUE) %>%
+  colMeans()
+
+#plot using x_offense/y_offense now
+ggplot(grid, aes(x_offense, y_offense, fill = xg)) +
+  geom_tile() +
+  scale_fill_viridis_c(option = "magma", labels = scales::percent) +
+  labs(title = "Posterior Mean xG Surface", fill = "xG", 
+       x = "x (offense)", y = "y (offense)")
+```
+
+```{r eval = FALSE}
+#Player-level random effects
+player_effects <- fit %>%
+  spread_draws(r_player_id[player_id, ])  %>%
+  median_qi(.width = 0.95) %>%
+  left_join(
+    shots %>% distinct(player_id, player_name) %>% count(player_id, player_name),
+    by = "player_id"
+  ) %>%
+  arrange(desc(r_player_id))
+
+#Top 15 overperformers vs bottom 15
+player_effects %>%
+  slice(c(1:15, (n()-14):n())) %>%
+  ggplot(aes(x = r_player_id, y = reorder(player_name, r_player_id),
+             xmin = .lower, xmax = .upper)) +
+  geom_pointrange() +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "red") +
+  labs(title = "Player random effects: shooting skill beyond location",
+       x = "Random intercept (log-odds)", y = NULL)
+```
+
+## TRY AGAIN : ADJUSTED PRIOR
+*same just new prior*
+```{r}
+#TRY AGAIN new PRIOR
+#set priors 
+priors2 <- c(
+  prior(normal(0, 1.5), class = b),           # fixed effect coeff.
+  prior(normal(-2, 1),  class = Intercept),   # baseline log-odds; ~12% base rate
+  prior(exponential(2), class = sd)           # SD player random effects  ##CHANGE to exponential(2)
+)
+
+#Save + reload 
+if (!file.exists("new_fit.rds")) {
+  new_fit <- brm(
+  formula  = shot_formula,
+  data     = shots,
+  family   = bernoulli(link = "logit"),
+  prior    = priors2,
+  chains   = 2,
+  iter     = 1000,          # 500 warmup + 500 sampling per chain
+  cores    = 4,   # for speed 
+  seed     = 42,
+  control  = list(adapt_delta = 0.95)   # reduce divergences on hierarchical models
+)
+  saveRDS(fit, "new_fit.rds")
+} else {
+  new_fit <- readRDS("new_fit.rds")
+}
+```
+
+```{r}
+summary(new_fit)
+plot(new_fit)
+```
+
+```{r}
+#Posterior predictive check
+pp_plot <- pp_check(new_fit, ndraws = 100)
+print(pp_plot)
+```
+
+Compare to recorded xG.
+```{r}
+# Check the variable exists + range
+shots %>%
+  filter(!is.na(sl_xg_all_shots)) %>%
+  summarise(
+    n        = n(),
+    mean_xg  = mean(sl_xg_all_shots),
+    min_xg   = min(sl_xg_all_shots),
+    max_xg   = max(sl_xg_all_shots)
+  )
+
+#extract models predictions + join 
+#posterior mean xG for every shot
+shots$xg_model <- posterior_epred(
+  new_fit,
+  newdata        = shots,
+  re_formula     = NA,          # population-level only
+  allow_new_levels = TRUE
+) %>% colMeans()
+
+# Join + compare
+comparison <- shots %>%
+  filter(!is.na(sl_xg_all_shots)) %>%
+  select(player_id, player_name, goal, xg_model, sl_xg_all_shots)
+```
+
+Run comparisons
+```{r}
+#correlation
+cor(comparison$xg_model, comparison$sl_xg_all_shots, use = "complete.obs")
+
+#plot
+comp_plot <- ggplot(comparison, aes(x = sl_xg_all_shots, y = xg_model)) +
+  geom_point(alpha = 0.1) +
+  geom_abline(slope = 1, intercept = 0, color = "red", linetype = "dashed") +
+  geom_smooth(method = "lm", color = "blue") +
+  labs(
+    title = "xG Bayesian Model vs Avs xG",
+    x     = "Avs xG",
+    y     = "Bayesian xG"
+  )
+print(comp_plot)
+
+#calibration
+comparison %>%
+  summarise(
+    my_xg_mean      = mean(xg_model),
+    avs_xg_mean       = mean(sl_xg_all_shots)
+  )
+```
+
+Visual heatmap of xG surface.
+```{r}
+#grid over the rink
+grid <- expand_grid(
+  x_adj = seq(min(shots$x_adj), max(shots$x_adj), length.out = 80),
+  y_adj = seq(min(shots$y_adj), max(shots$y_adj), length.out = 80)
+) %>%
+  mutate(
+    x_scaled = (x_adj - mean(shots$x_adj)) / sd(shots$x_adj),
+    y_scaled = (y_adj - mean(shots$y_adj)) / sd(shots$y_adj),
+    player_id = NA    # population-level prediction 
+  )
+
+#Posterior mean xG per grid cell
+grid$xg <- posterior_epred(new_fit, newdata = grid, re_formula = NA, allow_new_levels = TRUE) %>%
+  colMeans()
+
+heatmap <- ggplot(grid, aes(x_adj, y_adj, fill = xg)) +
+  geom_tile() +
+  scale_fill_viridis_c(option = "magma", labels = scales::percent) +
+  labs(title = "Posterior Mean xG Surface", fill = "xG", x = "x (adjusted)", y = "y (adjusted)")
+plot(heatmap)
+
+##NEW
+grid <- expand_grid(
+  x_offense = seq(min(shots$x_offense), max(shots$x_offense), length.out = 80),
+  y_offense = seq(min(shots$y_offense), max(shots$y_offense), length.out = 80)
+) %>%
+  mutate(
+    x_scaled = (x_offense - mean(shots$x_offense)) / sd(shots$x_offense),
+    y_scaled = (y_offense - mean(shots$y_offense)) / sd(shots$y_offense),
+    player_id = NA
+  )
+
+grid$xg <- posterior_epred(new_fit, newdata = grid, re_formula = NA, allow_new_levels = TRUE) %>%
+  colMeans()
+
+#Plot using x_offense/y_offense now
+ggplot(grid, aes(x_offense, y_offense, fill = xg)) +
+  geom_tile() +
+  scale_fill_viridis_c(option = "magma", labels = scales::percent) +
+  labs(title = "Posterior Mean xG Surface", fill = "xG", 
+       x = "x (offense)", y = "y (offense)")
+```
+
+Uncertainity heatmap visual.
+```{r}
+#full posterior draws per grid cell
+pred_draws <- posterior_epred(
+  new_fit, 
+  newdata = grid, 
+  re_formula = NA, 
+  allow_new_levels = TRUE
+)
+
+#Mean surface
+grid$xg_mean <- colMeans(pred_draws)
+
+#Uncertainty surface
+grid$xg_sd <- apply(pred_draws, 2, sd)
+
+#uncertainty
+uncertain_heatmap <- ggplot(grid, aes(x_offense, y_offense, fill = xg_sd)) +
+  geom_tile() +
+  scale_fill_viridis_c(option = "mako", labels = scales::percent) +
+  labs(
+    title = "Posterior Uncertainty: xG Surface SD",
+    fill  = "SD",
+    x     = "x (offense)",
+    y     = "y (offense)"
+  )
+plot(uncertain_heatmap)
+```
+
+```{r}
+#Player-level random effects
+player_effects <- new_fit %>%
+  spread_draws(r_player_id[player_id, ])  %>%
+  median_qi(.width = 0.95) %>%
+  left_join(
+    shots %>% distinct(player_id, player_name) %>% count(player_id, player_name),
+    by = "player_id"
+  ) %>%
+  arrange(desc(r_player_id))
+
+# Top 15 overperformers vs bottom 15
+player_effects %>%
+  slice(c(1:15, (n()-14):n())) %>%
+ggplot(aes(x = r_player_id, y = reorder(player_name, r_player_id),
+             xmin = .lower, xmax = .upper)) +
+  geom_pointrange() +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "red") +
+  labs(title = "Player Random Effects: shooting skill beyond location", 
+       x = "Random intercept (log-odds)", y = NULL)
+print(player_effects)
+```
+
+
+
+
+## Deeper Research Question
+# Part 2 asks: is that surface stable across a season?
+# Specifically, does a player's shooting probability from a given location
+# drift across 10-game windows, or is the part 1 snapshot reliable?
+
+# The key estimand is sigma_drift: the SD of how much each player's xG-location relationship shifts over time. 
+
+Build longitudinal shot data. 
+```{r}
+#assign each shot to a time block (10-game windows)
+#create a chronological game index per player
+shots_long <- shots %>%
+  # bring in game_date from games table
+  left_join(games %>% select(game_id, game_date), by = "game_id") %>%
+  arrange(player_id, game_date) %>%
+  group_by(player_id) %>%
+  mutate(
+    # rank each game chronologically per player (1st game, 2nd game)
+    game_rank  = dense_rank(game_date),
+    # assign to 10-game windows: games 1-10 = block 1, 11-20 = block 2, etc
+    time_block = ceiling(game_rank / 10)
+  ) %>%
+  ungroup() %>%
+  group_by(player_id) %>%
+  # only keep players with at least 2 time blocks
+  filter(n_distinct(time_block) >= 2) %>%
+  ungroup() %>%
+   # create a clean player index 
+  mutate(
+    player_idx = as.integer(factor(player_id)),
+    
+    # USE x_offense/y_offense
+    x_scaled = (x_offense - mean(shots$x_offense)) / sd(shots$x_offense),
+    y_scaled = (y_offense - mean(shots$y_offense)) / sd(shots$y_offense)
+  )
+
+# check data 
+shots_long %>%
+  group_by(player_id) %>%
+  summarise(
+    n_shots  = n(),
+    n_blocks = n_distinct(time_block),
+    n_goals  = sum(goal)
+  ) %>%
+  summary()
+```
+
+Aggregate to player block level. 
+```{r}
+#model goal rate per block rather than individual shots
+player_blocks <- shots_long %>%
+  group_by(player_id, player_name, time_block) %>%
+  summarise(
+    goals      = sum(goal),         # goals scored in block
+    shots      = n(),               # shots taken in block
+    # average shot location per block (controls for quality of chances)
+    mean_x     = mean(x_scaled),
+    mean_y     = mean(y_scaled),
+    .groups    = "drop"
+  ) %>%
+  # create a lagged block for the AR(1) structure, the previous block's index
+  group_by(player_id) %>%
+  arrange(time_block) %>%
+  mutate(
+    prev_block = lag(time_block),   # NA for first block of each player
+    block_seq  = row_number()       # sequential block # within player
+  ) %>%
+  ungroup()
+
+#structure
+glimpse(player_blocks)
+player_blocks %>%
+  summarise(
+    mean_shots = mean(shots),
+    mean_goals = mean(goals),
+    min_shots  = min(shots),
+    max_shots  = max(shots)
+  )
+```
+```{r}
+player_blocks %>%
+  count(shots < 5)
+```
+
+Define dynamic model
+```{r}
+dynamic_formula <- bf(
+  goals | trials(shots) ~
+    mean_x + mean_y +
+    (time_block || player_id)) #removes the intercept-slope correlation since it was unidentifiable
+```
+
+Set priors for dynamic model on sigma_drift prior 
+```{r}
+dynamic_priors <- c(
+  # ~5% shooting rate baseline on log-odds scale, consistent w/ part 1
+  prior(normal(-3, 1),    class = Intercept),  #bc block-level binomial model
+  #fixed effects for shot location same as pt 1 
+  prior(normal(0, 1),     class = b),
+
+  # between-player baseline differences, consistent with part 1
+  prior(exponential(2),   class = sd, group= player_id, coef=Intercept),
+  
+  # sigma_drift do not think it will be large 
+  #exponential(2) keeps prior mass near zero while allowing real signal
+  prior(exponential(2), class=sd, group=player_id, coef= time_block)
+)
+```
+
+Fit dynamic model.
+```{r}
+#Save + reload 
+if (!file.exists("fit_dynamicmod.rds")) {
+  fit_dynamicmod <- brm(
+  formula   = dynamic_formula,
+  data      = player_blocks,
+  family    = binomial(link = "logit"),  # goals out of shots trials
+  prior     = dynamic_priors,
+  chains    = 4,
+  iter      = 3000,         # more iterations than Q1 
+  warmup    = 1500,
+  cores     = 4,
+  seed      = 42,
+  control   = list(
+    adapt_delta   = 0.97,   # higher than Q1 b/c hierarchical slopes need more tuning
+    max_treedepth = 12
+  )
+)
+  saveRDS(fit_dynamicmod, "fit_dynamicmod.rds")
+} else {
+  fit_dynamicmod <- readRDS("fit_dynamicmod.rds")
+}  #toke 6 minutes 
+```
+
+```{r}
+#diagnostics 
+summary(fit_dynamicmod)  # Rhat
+plot(fit_dynamicmod, ask = FALSE)  #Trace plots 
+
+# Posterior predictive check
+pp_check(fit_dynamicmod, ndraws = 100) +
+  labs(title = "Posterior predictive check — dynamic model")
+```
+sigma_drift = 0.03 with 95% CI (0.00, 0.07) 
+The Part 1 static xG surface is confirmed as a reliable seasonal picture. Player shooting profiles do not meaningfully drift across 10-game windows.
+
+```{r}
+player_blocks %>% count(goals) %>% arrange(goals)
+```
+
+#Answer question
+```{r}
+##how much does a player's xG surface shift across 10-game windows beyond what location alone predicts?
+
+sigma_drift <- as_draws_df(fit_dynamicmod) %>%
+  select(sigma_drift = `sd_player_id__time_block`)
+
+sigma_plot <- ggplot(sigma_drift, aes(x = sigma_drift)) +
+  stat_halfeye(.width = c(0.66, 0.95), fill = "#800000") +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "gray50") +
+  labs(
+    title    = "Posterior Distribution of xG Surface Drift (σ_Drift)",
+    x        = "σ_Drift (log-odds scale)",
+    y        = NULL
+  )
+print(sigma_plot)
+#numerical summary
+sigma_drift %>%
+  summarise(
+    median = median(sigma_drift),
+    lower  = quantile(sigma_drift, 0.025),
+    upper  = quantile(sigma_drift, 0.975)
+  )
+```
+
+```{r eval = FALSE}
+player_trajectories <- fit_dynamicmod %>%
+  spread_draws(r_player_id[player_id, term]) %>%
+  filter(term %in% c("Intercept", "time_block")) %>%
+  pivot_wider(names_from = term, values_from = r_player_id) %>%
+  left_join(
+    player_blocks %>% distinct(player_id, player_name, time_block),
+    by = "player_id"
+  ) %>%
+  mutate(
+    skill_at_block = Intercept + time_block.y * time_block.x
+  ) %>%
+  group_by(player_id, player_name, time_block.y) %>%
+  median_qi(skill_at_block, .width = 0.95) %>%
+  rename(time_block = time_block.y)
+
+# Top 12 players by shot volume
+top_players <- player_blocks %>%
+  group_by(player_id, player_name) %>%
+  summarise(total_shots = sum(shots), .groups = "drop") %>%
+  slice_max(total_shots, n = 12)
+
+player_trajectories %>%
+  filter(player_id %in% top_players$player_id) %>%
+  ggplot(aes(x = time_block, y = skill_at_block)) +
+  geom_ribbon(aes(ymin = .lower, ymax = .upper), alpha = 0.2, fill = "#5DCAA5") +
+  geom_line(color = "#0F6E56", linewidth = 0.8) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "gray50") +
+  facet_wrap(~ player_name, scales = "free_y") +
+  labs(
+    title    = "Player xG surface trajectories across the season",
+    subtitle = "0 = population xG baseline for their shot locations\nShaded = 95% credible interval; flat line = stable spatial shooting profile",
+    x        = "Time block (10-game windows)",
+    y        = "Deviation from population xG surface (log-odds)"
+  )
+```
+
+```{r eval = FALSE}
+player_summary %>%
+  arrange(desc(drift_median)) %>%
+  slice(1:15) %>%
+  ggplot(aes(x = drift_median, 
+             y = reorder(player_name, drift_median),
+             color = position_group)) +
+  geom_pointrange(aes(
+    xmin = quantile(drift_median, 0.025),
+    xmax = quantile(drift_median, 0.975)
+  )) +
+  geom_vline(xintercept = median(player_summary$drift_median),
+             linetype = "dashed") +
+  labs(title = "Top 15 players by xG surface drift",
+       x = "Drift magnitude (log-odds)", y = NULL)
+```
+
+
+```{r}
+# Add shot volume +  CI width to player_summary
+player_summary <- fit_dynamicmod %>%
+  spread_draws(r_player_id[player_id, term]) %>%
+  filter(term %in% c("Intercept", "time_block")) %>%
+  pivot_wider(names_from = term, values_from = r_player_id) %>%
+  group_by(player_id) %>%
+  summarise(
+    skill_median = median(Intercept),
+    drift_median = median(abs(time_block)),
+    skill_lower  = quantile(Intercept, 0.025),
+    skill_upper  = quantile(Intercept, 0.975),
+    .groups      = "drop"
+  ) %>%
+  left_join(
+    players %>% select(player_id, player_name, position_group),
+    by = "player_id"
+  ) %>%
+  # join shot volume for sizing
+  left_join(
+    shots_long %>% count(player_id, name = "n_shots"),
+    by = "player_id"
+  ) %>%
+  #compute CI width as uncertainty measure
+  mutate(ci_width = skill_upper - skill_lower)
+
+# Store reference lines for quadrant colors
+vline <- 0
+hline <- median(player_summary$drift_median)
+
+ggplot(player_summary,
+       aes(x = skill_median, y = drift_median, color = position_group)) +
+  
+  #quadrant shading
+  annotate("rect",
+           xmin = 0,    xmax = Inf,
+           ymin = -Inf, ymax = hline,
+           fill = "green", alpha = 0.06) +   # reliable high-danger shooters
+  annotate("rect",
+           xmin = -Inf, xmax = 0,
+           ymin = -Inf, ymax = hline,
+           fill = "red", alpha = 0.06) +     # consistent underperformers
+  annotate("rect",
+           xmin = 0,    xmax = Inf,
+           ymin = hline, ymax = Inf,
+           fill = "yellow", alpha = 0.06) +  # high skill but inconsistent
+  annotate("rect",
+           xmin = -Inf, xmax = 0,
+           ymin = hline, ymax = Inf,
+           fill = "gray", alpha = 0.06) +    # below average + inconsistent
+
+  # size points by CI width big==more uncertain 
+  geom_point(aes(size = ci_width), alpha = 0.65) +
+  scale_size_continuous(
+    name   = "Uncertainty\n(95% CI width)",
+    range  = c(1, 5)
+  ) +
+  
+  geom_vline(xintercept = vline, linetype = "dashed", color = "gray40") +
+  geom_hline(yintercept = hline, linetype = "dashed", color = "gray40") +
+  
+  # quadrant annotation labels
+  annotate("text", x = Inf,  y = -Inf,  hjust = 2.1, vjust = -0.5,
+           label = "Reliable High-Danger", size = 2.8, color = "darkgreen") +
+  annotate("text", x = -Inf, y = -Inf,  hjust = -0.1, vjust = -0.5,
+           label = "Consistent underperformers", size = 2.8, color = "darkred") +
+  annotate("text", x = Inf,  y = Inf,   hjust = 2.1, vjust = 1.5,
+           label = "Skilled but inconsistent", size = 2.8, color = "goldenrod4") +
+  annotate("text", x = -Inf, y = Inf,   hjust = -0.1, vjust = 1.5,
+           label = "Below Avg. + inconsistent", size = 2.8, color = "gray40") +
+
+  ggrepel::geom_text_repel(
+    data = player_summary %>%
+      filter(abs(skill_median) > quantile(abs(skill_median), 0.90) |
+             drift_median      > quantile(drift_median, 0.90)),
+    aes(label = player_name),
+    size = 3, max.overlaps = 15
+  ) +
+  
+  labs(
+    title    = "xG Surface: Average Deviation vs. Temporal Stability",
+    x        = "Average Deviation from Population xG Surface (log-odds)",
+    y        = "xG Surface Drift Across Time Blocks",
+    color    = "Position"
+  ) +
+  theme_bw() +
+  theme(legend.position = "right")
+```
+
+Forecast players next block xG
+```{r}
+player_blocks %>% 
+  select(player_name) %>% 
+  distinct() %>% 
+  arrange(player_name) %>%
+  print(n = 50)
+```
+
+```{r}
+forecast_xg <- function(player_name_input, n_future_blocks = 3) {
+  
+  player_data <- player_blocks %>%
+    filter(player_name == player_name_input)
+  
+  #safety check
+  if (nrow(player_data) == 0) {
+    stop(paste("Player not found:", player_name_input, 
+               "\nCheck player_blocks %>% distinct(player_name)"))
+  }
+  
+  last_block  <- max(player_data$time_block)
+  future_data <- tibble(
+    player_id   = unique(player_data$player_id),
+    player_name = player_name_input,
+    time_block  = seq(last_block + 1, last_block + n_future_blocks),
+    shots       = round(mean(player_data$shots)),
+    mean_x      = mean(player_data$mean_x),
+    mean_y      = mean(player_data$mean_y)
+  )
+  
+  preds <- posterior_predict(
+    fit_dynamicmod,          
+    newdata          = future_data,
+    allow_new_levels = FALSE
+  )
+  
+  future_data %>%
+    mutate(
+      pred_goals_median = apply(preds, 2, median),
+      pred_goals_lower  = apply(preds, 2, quantile, 0.025),
+      pred_goals_upper  = apply(preds, 2, quantile, 0.975),
+      pred_xg           = pred_goals_median / shots
+    )
+}
+```
+
+```{r}
+# name output
+forecast_xg("Fagemo, Samuel", n_future_blocks = 3)
+forecast_xg("Gaudette, Adam", n_future_blocks = 3)
+
+forecast_xg("Gawdin, Glenn", n_future_blocks = 3)
+forecast_xg("Vrana, Jakub", n_future_blocks = 3)
+forecast_xg("Smejkal, Jiri", n_future_blocks = 3)
+```
+
+```{r}
+# Combine most unquie players forecasts into one table
+bind_rows(
+  forecast_xg("Fagemo, Samuel",  n_future_blocks = 3),
+  forecast_xg("Gaudette, Adam",  n_future_blocks = 3),
+  forecast_xg("Gawdin, Glenn",   n_future_blocks = 3),
+  forecast_xg("Vrana, Jakub",    n_future_blocks = 3),
+  forecast_xg("Smejkal, Jiri",   n_future_blocks = 3)
+) %>%
+  select(player_name, time_block, shots,
+         pred_goals_median, pred_goals_lower, 
+         pred_goals_upper, pred_xg) %>%
+  mutate(pred_xg = scales::percent(pred_xg, accuracy = 0.1)) %>%
+  kable(
+    digits  = 2,
+    caption = "Posterior Predicted Goals and Implied xG — Next 3 blocks",
+    col.names = c("Player", "Block", "Shots",
+                  "Goals (median)", "Goals (lower)", 
+                  "Goals (upper)", "xG")
+  )
+```
+
+
+
+##3. How does each puck action change the probability of generating a dangerous offensive outcome (e.g., shot or slot shot) within the next 10 seconds, given spatial and game context?
+
+```{r}
+# Check event types
+events %>% count(event_type) %>% arrange(desc(n))
+
+# Check flags + detail columns
+events %>% count(flags)
+events %>% count(detail)
+```
+
+Define what a dangerous outcome is + build the outcome window.
+```{r}
+#sort all events chronologically within each game
+events_seq <- events %>%
+  arrange(game_id, period, period_time) %>%
+  group_by(game_id) %>%
+  mutate(
+    # absolute time in seconds within game
+    abs_time = (as.numeric(period) - 1) * 1200 + period_time,
+    event_idx = row_number()
+  ) %>%
+  ungroup()
+
+# For each event, look ahead X seconds and flag if a shot/goal occurs
+#binary outcome model will predict
+WINDOW_SECONDS <- 10  #try 6, 10, 15
+
+events_labeled <- events_seq %>%
+  group_by(game_id) %>%
+  mutate(
+    # for each event, find the next shot/goal within the window
+    dangerous_next = map_lgl(seq_along(abs_time), function(i) {
+      future <- abs_time[(i+1):min(i+20, n())]
+      future_types <- event_type[(i+1):min(i+20, n())]
+      future_team  <- team[(i+1):min(i+20, n())]
+      
+      # same team must generate the shot within the window
+      any(
+        future_types %in% c("shot", "goal") &
+        future_team == team[i] &
+        (future - abs_time[i]) <= WINDOW_SECONDS &
+        (future - abs_time[i]) > 0,
+        na.rm = TRUE
+      )
+    })
+  ) %>%
+  ungroup()
+
+```
+
+```{r}
+#Feature engineering
+model_data <- events_labeled %>%
+  filter(
+    !is.na(x_adj),
+    !is.na(y_adj),
+    !is.na(event_type),
+    !is.na(player_id),
+    # exclude stoppages and faceoffs
+    !event_type %in% c("faceoff", "stoppage", "period_end")
+  ) %>%
+  mutate(
+    outcome_bin  = as.integer(dangerous_next),
+    is_successful = as.integer(outcome == "successful"),
+    
+    # normalize to offensive zone
+    x_offense    = abs(x_adj),
+    y_offense    = ifelse(x_adj > 0, -y_adj, y_adj),
+    x_scaled     = (x_offense - mean(x_offense, na.rm = TRUE)) / 
+                    sd(x_offense, na.rm = TRUE),
+    y_scaled     = (y_offense - mean(y_offense, na.rm = TRUE)) / 
+                    sd(y_offense, na.rm = TRUE),
+    #flag into binary features  
+    is_timer= str_detect(flags, "1timer"),
+    is_seam= str_detect(flags, "seam"),
+    is_lowhigh= str_detect(flags, "lowhigh"),
+    
+    # Rush situation
+is_odd_man    = str_detect(detail, "1on0|2on1|3on1|3on2"),
+is_even_rush  = str_detect(detail, "1on1|2on2|3on3"),
+
+# Shot quality
+is_slot_shot  = str_detect(detail, "slot") & event_type == "shot",
+is_deflection = str_detect(detail, "deflection"),
+
+# Pass danger
+is_slot_pass  = detail == "slot" & event_type == "pass",
+is_rush_pass  = str_detect(detail, "rush") & event_type == "pass",
+is_zone_entry = str_detect(detail, "ozentry"),
+    
+    
+    # clean event type as factor for fixed effects
+    action_type  = fct_lump_n(as.factor(event_type), n = 8) %>%  # keep top 8 types
+      relevel(ref = "pass"), 
+      
+  ) %>%
+  filter(!is.na(outcome_bin))
+```
+
+```{r}
+#outcome rate by action type
+model_data %>%
+  group_by(action_type) %>%
+  summarise(
+    n            = n(),
+    danger_rate  = mean(outcome_bin)
+  ) %>%
+  arrange(desc(danger_rate))
+```
+*Baseline danger rate is ~26% for passes which is set as the reference level, bc passes is the most common action along with being in the middle of the danger spectrum.
+
+```{r}
+#Model formula
+part3_formula <- bf(
+  outcome_bin ~ action_type +
+                x_scaled + y_scaled +
+                I(x_scaled^2) + I(y_scaled^2) +
+                is_odd_man +      # rush situation
+                is_even_rush +
+                is_slot_shot +    # shot from slot
+                is_slot_pass +    # pass to slot
+                is_rush_pass +    # pass off rush
+                is_zone_entry +   # zone entry pass/reception
+                is_timer +
+                is_seam +
+                is_successful +
+                period +
+                (1 | player_id)
+)
+```
+# Fixed effects: action type + spatial location + period
+# Random intercept: player_id (some players consistently generate danger)
+# Random slope: action_type per player 
+
+```{r}
+# Check baseline danger rate to set intercept prior
+mean(model_data$outcome_bin)
+```
+
+```{r}
+#Priors
+# Baseline: if ~20-30% of actions lead to danger within 10s,log-odds, log(0.25/0.75)=  -1.1
+part3_priors <- c(
+  # baseline probability of dangerous outcome
+  prior(normal(-1, 1),   class = Intercept),
+  
+  # wider than parts 1/2 because action effects could be substantial
+  prior(normal(0, 1.5),  class = b),
+  # odd man rushes and 1-timers should have stronger effects
+  # slightly wider prior to allow large positive coefficients
+  prior(normal(0, 1.5),  class = b, coef = "is_timerTRUE"),
+  prior(normal(0, 1.5),  class = b, coef = "is_seamTRUE"),
+  prior(normal(0, 1.5), class = b, coef = "is_successful"),
+  prior(normal(0, 2), class = b, coef = "is_odd_manTRUE"),
+prior(normal(0, 2), class = b, coef = "is_slot_shotTRUE"),
+prior(normal(0, 2), class = b, coef = "is_slot_passTRUE"),
+ 
+  # player random intercept
+  prior(exponential(2),  class = sd)
+)
+```
+
+```{r}
+# CODE IS SOOOO SLOW
+#Randomly sample 20% of rows aka still 200k+ observations
+set.seed(42)
+model_data_small <- model_data %>%
+  slice_sample(prop = 0.20)
+
+# Check outcome rate is preserved
+mean(model_data_small$outcome_bin)  # should still be about 0.22
+```
+```{r}
+if (!file.exists("fit_3.rds")) {
+  fit_3 <- brm(
+    formula  = part3_formula,
+    data     = model_data_small,  # subsampled data
+    family   = bernoulli(link = "logit"),
+    prior    = part3_priors,
+    chains   = 2,
+    iter     = 1000,
+    warmup   = 500,
+    cores    = 4,
+    seed     = 42,
+    control  = list(adapt_delta = 0.95, max_treedepth = 12)
+  )
+  saveRDS(fit_3, "fit_3.rds")
+} else {
+  fit_3 <- readRDS("fit_3.rds")
+}
+```
+
+
+```{r}
+#Fit model
+if (!file.exists("modfit_3.rds")) {
+  modfit_3 <- brm(
+    formula  = part3_formula,
+    data     = model_data_small,
+    family   = bernoulli(link = "logit"),
+    prior    = part3_priors,
+    chains   = 4,
+    iter     = 2000,
+    warmup   = 1000,
+    cores    = 4,
+    seed     = 42,
+    control  = list(adapt_delta = 0.95,
+    max_treedepth = 12)
+  )
+  saveRDS(modfit_3, "modfit_3.rds")
+} else {
+  modfit_3 <- readRDS("modfit_3.rds")
+}
+```
+
+```{r}
+#Diagnostics
+summary(fit_3)   # Rhat 
+plot(fit_3)
+pp_check(fit_3, ndraws = 100)
+```
+
+```{r}
+# Extract posterior draws for action type coefficients
+action_effects <- as_draws_df(fit_3) %>%
+  select(starts_with("b_action_type")) %>%
+  pivot_longer(everything(), names_to = "action", values_to = "log_odds") %>%
+  mutate(
+    action = str_remove(action, "b_action_type"),
+    # convert log-odds shift to probability scale relative to baseline
+    prob_shift = plogis(log_odds) - plogis(0)
+  )
+
+#Plot
+action_effects %>%
+  ggplot(aes(x = log_odds, y = reorder(action, log_odds))) +
+  stat_halfeye(.width = c(0.66, 0.95)) +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "#800000") +
+  labs(
+    title    = "Effect of Puck Action on P(dangerous outcome within 10s)",
+    x        = "Log-odds Coefficient",
+    y        = NULL
+  )
+```
+
+Spatial heatmap
+```{r}
+# Extract exact levels the model was trained on
+model_action_levels <- fit_3$data$action_type %>% levels()
+model_period_levels <- fit_3$data$period %>% levels()
+
+# Check 
+model_action_levels
+model_period_levels
+
+grid_p3 <- expand_grid(
+  x_offense = seq(0, 100, length.out = 60),
+  y_offense = seq(-30, 30, length.out = 60)
+) %>%
+  mutate(
+    x_scaled      = (x_offense - mean(model_data_small$x_offense)) / 
+                     sd(model_data_small$x_offense),
+    y_scaled      = (y_offense - mean(model_data_small$y_offense)) / 
+                     sd(model_data_small$y_offense),
+    
+    # use levels directly from fitted model
+    action_type   = factor("pass", levels = model_action_levels),
+    period        = 2L,
+    player_id     = NA,
+    
+    is_odd_man    = factor(FALSE, levels = c(FALSE, TRUE)),
+    is_even_rush  = factor(FALSE, levels = c(FALSE, TRUE)),
+    is_slot_shot  = factor(FALSE, levels = c(FALSE, TRUE)),
+    is_slot_pass  = factor(FALSE, levels = c(FALSE, TRUE)),
+    is_rush_pass  = factor(FALSE, levels = c(FALSE, TRUE)),
+    is_zone_entry = factor(FALSE, levels = c(FALSE, TRUE)),
+    is_timer      = factor(FALSE, levels = c(FALSE, TRUE)),
+    is_seam       = factor(FALSE, levels = c(FALSE, TRUE)),
+    is_successful = 1L
+  )
+
+grid_p3$danger_prob <- posterior_epred(
+  fit_3,
+  newdata          = grid_p3,
+  re_formula       = NA,
+  allow_new_levels = TRUE
+) %>% colMeans()
+
+ggplot(grid_p3, aes(x_offense, y_offense, fill = danger_prob)) +
+  geom_tile() +
+  scale_fill_viridis_c(option = "magma", labels = scales::percent) +
+  labs(
+    title    = "P(dangerous outcome within 10s) by location",
+    fill     = "P(danger)",
+    x        = "x (offense)",
+    y        = "y (offense)"
+  )
+#Baseline: successful pass
+```
+
+
+Per-action danger probability summary table.
+```{r}
+# Marginal predicted danger probability per action type
+# Fix action_summary to match model levels
+action_summary <- model_data_small %>%
+  mutate(action_type = factor(action_type, levels = model_action_levels)) %>%
+  filter(!is.na(action_type)) %>%
+  group_by(action_type) %>%
+  summarise(
+    n             = n(),
+    observed_rate = mean(outcome_bin),
+    .groups       = "drop"
+  )
+
+#posterior predicted probability for each action type at mean location
+newdata_actions <- model_data_small %>%
+  mutate(action_type = factor(action_type, levels = model_action_levels)) %>%
+  filter(!is.na(action_type)) %>%
+  group_by(action_type) %>%
+  summarise(
+    x_scaled      = mean(x_scaled),
+    y_scaled      = mean(y_scaled),
+    period        = 2L,
+    player_id     = NA,
+    is_odd_man    = factor(FALSE, levels = c(FALSE, TRUE)),
+    is_even_rush  = factor(FALSE, levels = c(FALSE, TRUE)),
+    is_slot_shot  = factor(FALSE, levels = c(FALSE, TRUE)),
+    is_slot_pass  = factor(FALSE, levels = c(FALSE, TRUE)),
+    is_rush_pass  = factor(FALSE, levels = c(FALSE, TRUE)),
+    is_zone_entry = factor(FALSE, levels = c(FALSE, TRUE)),
+    is_timer      = factor(FALSE, levels = c(FALSE, TRUE)),
+    is_seam       = factor(FALSE, levels = c(FALSE, TRUE)),
+    is_successful = 1L,
+    .groups       = "drop"
+  )
+
+# Verify levels match
+levels(newdata_actions$action_type)
+
+#posterior predictions
+pred_probs <- posterior_epred(
+  fit_3,
+  newdata          = newdata_actions,
+  re_formula       = NA,
+  allow_new_levels = TRUE
+)
+
+# Join preds to summary
+action_summary <- action_summary %>%
+  mutate(
+    posterior_mean  = colMeans(pred_probs),
+    posterior_lower = apply(pred_probs, 2, quantile, 0.025),
+    posterior_upper = apply(pred_probs, 2, quantile, 0.975)
+  ) %>%
+  arrange(desc(posterior_mean))
+
+print(action_summary)
+
+# Plot
+action_summary %>%
+  ggplot(aes(x = posterior_mean, 
+             y = reorder(action_type, posterior_mean),
+             xmin = posterior_lower,
+             xmax = posterior_upper)) +
+  geom_pointrange() +
+  geom_vline(xintercept = mean(model_data_small$outcome_bin),
+             linetype = "dashed", color = "gray50") +
+  scale_x_continuous(labels = scales::percent) +
+  labs(
+    title    = "Posterior Predicted Danger Probability by Action Type",
+    subtitle = "Dashed line = Overall Observed Danger Rate (21.9%)",
+    x        = "P(dangerous outcome within 10s)",
+    y        = NULL
+  )
+```
+
+Contextual Features Effect 
+```{r}
+# Extract all contextual binary feature posteriors
+context_effects <- as_draws_df(fit_3) %>%
+  select(
+    "One-Timer"      = b_is_timerTRUE,
+    "Successful"     = b_is_successful,
+    "Slot Pass"      = b_is_slot_passTRUE,
+    "Rush Pass"      = b_is_rush_passTRUE,
+    "Seam Pass"      = b_is_seamTRUE,
+    "Zone Entry"     = b_is_zone_entryTRUE,
+    "Slot Shot"      = b_is_slot_shotTRUE
+  ) %>%
+  pivot_longer(everything(), names_to = "feature", values_to = "log_odds") %>%
+  mutate(
+    prob_shift = plogis(log_odds) - plogis(0)
+  )
+
+context_effects %>%
+  ggplot(aes(x = log_odds, y = reorder(feature, log_odds))) +
+  stat_halfeye(.width = c(0.66, 0.95), fill = "#800000") +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "gray50") +
+  labs(
+    title    = "Effect of Puck Action Context on P(danger within 10s)",
+    x        = "Log-odds coefficient",
+    y        = NULL
+  ) +
+  theme_bw()
+```
+
+Compare Same Action With vs Without Key Contexts
+```{r}
+#comparison scenarios
+scenarios <- tibble(
+  scenario      = c("Pass — baseline",
+                    "Pass + one-timer",
+                    "Pass + slot pass",
+                    "Pass + rush pass",
+                    "Pass + seam",
+                    "Carry — baseline",
+                    "Reception — baseline"),
+  action_type   = factor(c("pass","pass","pass","pass","pass","carry","reception"),
+                         levels = model_action_levels),
+  is_timer      = factor(c(FALSE,TRUE,FALSE,FALSE,FALSE,FALSE,FALSE), levels=c(FALSE,TRUE)),
+  is_slot_pass  = factor(c(FALSE,FALSE,TRUE,FALSE,FALSE,FALSE,FALSE), levels=c(FALSE,TRUE)),
+  is_rush_pass  = factor(c(FALSE,FALSE,FALSE,TRUE,FALSE,FALSE,FALSE), levels=c(FALSE,TRUE)),
+  is_seam       = factor(c(FALSE,FALSE,FALSE,FALSE,TRUE,FALSE,FALSE), levels=c(FALSE,TRUE)),
+  is_odd_man    = factor(FALSE, levels=c(FALSE,TRUE)),
+  is_even_rush  = factor(FALSE, levels=c(FALSE,TRUE)),
+  is_slot_shot  = factor(FALSE, levels=c(FALSE,TRUE)),
+  is_zone_entry = factor(FALSE, levels=c(FALSE,TRUE)),
+  x_scaled      = 0,
+  y_scaled      = 0,
+  period        = 2L,
+  player_id     = NA,
+  is_successful = 1L
+)
+
+scenario_preds <- posterior_epred(
+  fit_3,
+  newdata          = scenarios,
+  re_formula       = NA,
+  allow_new_levels = TRUE
+)
+
+scenarios <- scenarios %>%
+  mutate(
+    pred_mean  = colMeans(scenario_preds),
+    pred_lower = apply(scenario_preds, 2, quantile, 0.025),
+    pred_upper = apply(scenario_preds, 2, quantile, 0.975)
+  )
+
+ggplot(scenarios,
+       aes(x = pred_mean,
+           y = reorder(scenario, pred_mean),
+           xmin = pred_lower,
+           xmax = pred_upper)) +
+  geom_pointrange(size = 0.8) +
+  geom_vline(xintercept = mean(model_data_small$outcome_bin),
+             linetype = "dashed", color = "gray50") +
+  scale_x_continuous(labels = scales::percent) +
+  labs(
+    title    = "How Context Transforms Danger Probability",
+    x        = "P(dangerous outcome within 10s)",
+    y        = NULL
+  ) +
+  theme_bw()
+```
+
+
+Player Random Effects for Danger Generation
+```{r}
+player_danger <- fit_3 %>%
+  spread_draws(r_player_id[player_id,]) %>%
+  median_qi(.width = 0.95) %>%
+  left_join(
+    model_data_small %>% distinct(player_id, player_name),
+    by = "player_id"
+  ) %>%
+  arrange(desc(r_player_id))
+
+# Top 15 and bottom 15
+player_danger %>%
+  slice(c(1:15, (n()-14):n())) %>%
+  ggplot(aes(x = r_player_id,
+             y = reorder(player_name, r_player_id),
+             xmin = .lower,
+             xmax = .upper)) +
+  geom_pointrange() +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "red") +
+  labs(
+    title    = "Player Random Effects: Danger Generation Beyond Action Context",
+    x        = "Random Intercept (log-odds)",
+    y        = NULL
+  ) +
+  theme_bw()
+```
