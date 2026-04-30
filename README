@@ -1,6 +1,6 @@
-## Bayesian Hierarchical Models for Expected Goals, Temporal Stability, and Possession Value in the AHL
+# Bayesian Hierarchical Models for Expected Goals, Temporal Stability, and Possession Value in the AHL
 
-# Project Contributors:
+**Project Contributors:**
 Sydney Stanton
 
 ## Project Overview
@@ -16,13 +16,13 @@ Data
 Source: Colorado Avalanche analytics team via the HALO Hackathon
 
 ## Final Results Summary 
-Question 1 — How does xG vary by shot location and player?
+### Question 1 — How does xG vary by shot location and player?
 Shot location is the dominant driver of expected goals. The quadratic depth term was the strongest predictor of goal probability, confirming that shooting percentage does not decline linearly with distance from the net but accelerates as shots move further away. The posterior mean xG surface showed the hot zone (30%+ xG) directly in front of the net, fanning outward in a cone shape, confirming the model learned correct hockey geography. A correlation of 0.56 was calculated between the model's xG and the Colorado Avalanche's proprietary xG metric, demonstrating that location and player alone explain roughly 32% of variance before adding any contextual features. The player random effect was near zero (sd = 0.05) after controlling for location, confirming that where you shoot from matters far more than who is shooting.
 
-Question 2 — Is the xG surface stable across a season?
+### Question 2 — Is the xG surface stable across a season?
 The static xG surface from Question 1 is a reliable seasonal summary. Sigma drift was estimated at 0.025 on the log-odds scale (95% CI: 0.001–0.071), corresponding to a shift of just 0.10% in goal probability per 10-game window, less than one-twentieth of a single goal across a typical block of 30 shots. Player shooting profiles do not meaningfully drift across 10-game windows, meaning coaches and analysts can rely on single-season location-adjusted xG estimates without worrying that early-season patterns will become obsolete by playoff time. A scatter plot classified players into four quadrants — reliable high-danger shooters (Fagemo, Samuel; Gawdin, Glenn), skilled but inconsistent (Gaudette, Adam), consistent underperformers, and below-average inconsistent, visually confirming that temporal instability is negligible for the vast majority of players.
 
-Question 3 — How does each puck action change danger probability?
+### Question 3 — How does each puck action change danger probability?
 Puck action context substantially outweighs location in predicting danger. The most important findings were:
 
 One-timers (+1.54 log-odds) — the strongest single predictor, adding roughly 15-20 percentage points of danger probability regardless of location
